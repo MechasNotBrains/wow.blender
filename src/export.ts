@@ -36,6 +36,8 @@ import type {
 const MODEL_EXTENSIONS = new Set(['.m2', '.wmo']);
 const SKIP_ROOTS = new Set(['cameras', 'interface']);
 const DEFAULT_BATCH = 25;
+const DEFAULT_MAX_OBJ_MB = 64;
+const BYTES_PER_MB = 1024 * 1024;
 
 interface ShardSpec {
   index: number;
@@ -98,6 +100,20 @@ const skip_roots_resolve = (args: string[]): Set<string> => {
   return skipped;
 };
 
+const max_obj_bytes_resolve = (args: string[]): number => {
+  const value = argument_value_resolve(args, '--maxObjMB=');
+
+  if (value === null)
+    return DEFAULT_MAX_OBJ_MB * BYTES_PER_MB;
+
+  const megabytes = Number.parseInt(value, 10);
+
+  if (Number.isInteger(megabytes) === false || megabytes < 1)
+    return DEFAULT_MAX_OBJ_MB * BYTES_PER_MB;
+
+  return megabytes * BYTES_PER_MB;
+};
+
 const batch_size_resolve = (args: string[]): number => {
   const value = argument_value_resolve(args, '--batch=');
 
@@ -124,9 +140,11 @@ const main = async (): Promise<void> => {
   const keep_gltf = flags.has('--keepGLTF');
   const keep_obj = flags.has('--keepOBJ');
   const strict_textures = flags.has('--strictTextures');
+  const resume = flags.has('--resume');
   const shard = shard_resolve(args);
   const skip_roots = skip_roots_resolve(args);
   const batch_size = batch_size_resolve(args);
+  const max_obj_bytes = max_obj_bytes_resolve(args);
 
   if (install_dir === undefined) {
     process.stderr.write(
@@ -183,6 +201,17 @@ const main = async (): Promise<void> => {
     if (skip_roots.has(asset_root_resolve(display_path)))
       return false;
 
+    if (resume) {
+      const blend_path = path.join(
+        out_dir,
+        asset_dir_resolve(display_path),
+        asset_slug_resolve(display_path) + '.blend'
+      );
+
+      if (fs.existsSync(blend_path))
+        return false;
+    }
+
     if (pattern === undefined)
       return true;
 
@@ -195,6 +224,14 @@ const main = async (): Promise<void> => {
 
   process.stdout.write('models ' + shard_models.length + ' of ' + models.length +
     ' (shard ' + shard.index + '/' + shard.count + ', batch ' + batch_size + ')\n');
+
+  if (flags.has('--list')) {
+    for (const display_path of shard_models)
+      process.stdout.write('PENDING ' + mpq_prefix_strip(display_path) + '\n');
+
+    mpq.close();
+    return;
+  }
 
   WMOLegacyExporter.clearCache();
 
@@ -244,6 +281,8 @@ const main = async (): Promise<void> => {
     const slug = asset_slug_resolve(display_path);
     const asset_dir = path.join(out_dir, relative_dir);
     const obj_path = path.join(asset_dir, slug + '.obj');
+
+    process.stdout.write('START ' + bare_path + '\n');
 
     try {
       const raw = mpq.getFile(display_path);
@@ -295,6 +334,15 @@ const main = async (): Promise<void> => {
 
       if (texture_count === 0)
         process.stderr.write('WARN ' + bare_path + ': no textures resolved\n');
+
+      const obj_bytes = fs.statSync(obj_path).size;
+
+      if (obj_bytes > max_obj_bytes) {
+        throw new Error(
+          'obj too large for conversion: ' + Math.round(obj_bytes / BYTES_PER_MB) +
+          'MB exceeds ' + Math.round(max_obj_bytes / BYTES_PER_MB) + 'MB'
+        );
+      }
 
       const mtl_path = obj_path.replace(/\.obj$/i, '.mtl');
       const flattened = await asset_textures_flatten(asset_dir, mtl_path);
